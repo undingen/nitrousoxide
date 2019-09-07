@@ -1,0 +1,3 @@
+[submodule "llvm2cranelift"]
+	path = llvm2cranelift
+	url = https://github.com/undingen/llvm2cranelift

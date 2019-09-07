@@ -1,0 +1,21 @@
+[package]
+name = "nitrousoxide"
+version = "0.1.0"
+authors = ["Marius Wachtler <undingen@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "nitrousoxide"
+crate-type = ["cdylib"]
+
+[dependencies]
+cranelift-native = "0.42.0"
+cranelift-codegen = "0.42.0"
+cranelift-simplejit = "0.42.0"
+cranelift-module = "0.42.0"
+cranelift-frontend = "0.42.0"
+cranelift-llvm = { path = "llvm2cranelift/lib/llvm" }
+failure = "*"
+lazy_static = "*"
