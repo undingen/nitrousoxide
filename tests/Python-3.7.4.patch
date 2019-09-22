@@ -1,0 +1,12 @@
+diff -ur Python-3.7.4.orig/Objects/longobject.c Python-3.7.4/Objects/longobject.c
+--- Python-3.7.4.orig/Objects/longobject.c	2019-10-01 12:13:05.720068627 -0300
++++ Python-3.7.4/Objects/longobject.c	2019-10-01 12:13:48.320070658 -0300
+@@ -40,7 +40,7 @@
+    The integers that are preallocated are those in the range
+    -NSMALLNEGINTS (inclusive) to NSMALLPOSINTS (not inclusive).
+ */
+-static PyLongObject small_ints[NSMALLNEGINTS + NSMALLPOSINTS];
++/*static*/ PyLongObject small_ints[NSMALLNEGINTS + NSMALLPOSINTS];
+ #ifdef COUNT_ALLOCS
+ Py_ssize_t quick_int_allocs, quick_neg_int_allocs;
+ #endif

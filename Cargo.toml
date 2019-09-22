@@ -19,3 +19,5 @@ cranelift-frontend = "0.42.0"
 cranelift-llvm = { path = "llvm2cranelift/lib/llvm" }
 failure = "*"
 lazy_static = "*"
+proc-maps = "0.1.6"
+libc = "*"

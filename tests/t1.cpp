@@ -17,6 +17,17 @@ extern "C" __attribute__ ((__noinline__)) int foo() {
     //return bar + 42;
 }
 
+extern "C" __attribute__ ((__noinline__)) int foo3() {
+    if(bar == 1)
+        return 5;
+    else if (bar == 1) return 15;
+    else if (bar == 4) return 15;
+
+    return bar*bar;
+    //++bar;
+    //return bar + 42;
+}
+
 
 
 
@@ -26,7 +37,7 @@ extern "C" __attribute__ ((__noinline__)) int foo2() {
     char s[10];
     s[0] = '9';
     s[1] =0;
-    return 1000 + fib(atoi((char*)s));
+    return 1000 + foo3(); //fib(atoi((char*)s));
     
     //return 1000 + foo();
 }
@@ -40,7 +51,7 @@ int main() {
     bar = -100;
     loadBitcode("target/debug/t1.ll");
 
-#if 1
+#if 0
     JitTarget* jit_target = createJitTarget((void*)foo2, 0);
 
     for (int i=0;i<3; ++i) {
@@ -51,7 +62,7 @@ int main() {
     JitTarget* jit_target = createJitTarget((void*)fib, 1);
 
     for (int i=0;i<3; ++i) {
-        int t = runJitTarget1(jit_target, 42);
+        int t = runJitTarget1(jit_target, 42+4);
         printf("ret %d\n", t);
     }
 #endif

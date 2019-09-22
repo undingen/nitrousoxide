@@ -4,15 +4,20 @@
 
 #include <Python.h>
 
-PyObject*
+#if 0
+long
 _pytest2_target() {
-    return PyLong_FromLong(400);
+    return PyLong_AsLong(PyLong_FromLong(400));
 }
+#else
+long
+_pytest2_target() {
+    return PyLong_Check(PyLong_FromLong(600));
+}
+#endif
 
 extern "C" __attribute__ ((__noinline__)) int foo() {
-    
-    return (int)(long)_pytest2_target();
-
+    return (int)_pytest2_target();
 }
 
 

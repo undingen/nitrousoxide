@@ -1,8 +1,10 @@
+use crate::syms::get_syms;
+
 use failure::Error;
 
 use cranelift_llvm;
 
-use cranelift_module::{default_libcall_names, Linkage, Module};
+use cranelift_module::{default_libcall_names, Backend, FuncId, Linkage, Module};
 use cranelift_simplejit::{SimpleJITBackend, SimpleJITBuilder};
 use std::mem;
 
@@ -21,6 +23,7 @@ const VERBOSITY: u32 = 0;
 
 lazy_static! {
     static ref MODULES: Mutex<Vec<cranelift_llvm::Module>> = Mutex::new(Vec::new());
+    static ref SYMS: Vec<(String, u64)> = get_syms();
 }
 
 pub fn load_bitcode(file_name: String) {
@@ -36,9 +39,13 @@ pub fn load_bitcode(file_name: String) {
     }
 
     MODULES.lock().unwrap().push(tmodule);
+
+    // hack access SYMS so they get initalized early...
+    assert!(SYMS.len() > 0);
 }
 
 fn get_funcref_for_extfunc_name(func: &mut Function, name: &ExternalName) -> Option<ir::FuncRef> {
+    //println! {"looking for {:?} in {:?}", name, func.dfg.ext_funcs};
     for e in func.dfg.ext_funcs.iter() {
         if e.1.name == *name {
             return Some(e.0);
@@ -47,7 +54,65 @@ fn get_funcref_for_extfunc_name(func: &mut Function, name: &ExternalName) -> Opt
     None
 }
 
-pub fn inlinefn_into(calleefunc: &mut Function, callsite: Inst, func: &Function) {
+fn import_externs_into_module<B>(
+    module: &mut Module<B>,
+    src_module: &cranelift_llvm::Module,
+    func: &mut Function,
+) -> HashMap<FuncId, String>
+where
+    B: Backend,
+{
+    let mut mapping = HashMap::new();
+    for ext_func in func.dfg.ext_funcs.iter_mut() {
+        let name_str = src_module.strings.get_str(&ext_func.1.name);
+        if VERBOSITY > 0 {
+            println!("\textern function: {:?}\t{}", ext_func, &name_str);
+        }
+        if let ExternalName::LibCall(..) = ext_func.1.name {
+            continue;
+        }
+        let new_id = module
+            .declare_function(
+                &name_str,
+                Linkage::Import,
+                &func.dfg.signatures[ext_func.1.signature],
+            )
+            .unwrap();
+
+        mapping.insert(new_id, name_str.to_owned());
+        if ext_func.1.name != ExternalName::from(new_id) {
+            if VERBOSITY > 0 {
+                println!("\t\tremapping to {}", ExternalName::from(new_id));
+            }
+            ext_func.1.name = ExternalName::from(new_id);
+        }
+    }
+
+    for gv in func.global_values.values() {
+        if let ir::GlobalValueData::Symbol { name, .. } = gv {
+            if VERBOSITY > 0 {
+                println!("\tgv: {:?}\t{}", name, src_module.strings.get_str(&name),);
+            }
+            let idx = module
+                .declare_data(
+                    src_module.strings.get_str(&name),
+                    Linkage::Import,
+                    false,
+                    None,
+                )
+                .unwrap();
+            if ExternalName::from(idx) != *name {
+                panic! {"mismatch {} != {}", ExternalName::from(idx), name};
+            }
+        } else {
+            panic! {"not handled"};
+        }
+    }
+
+    mapping
+}
+
+fn inlinefn_into(calleefunc: &mut Function, callsite: Inst, func: &Function) {
     let callsite_data = calleefunc.dfg[callsite].clone();
     let mut pos = FuncCursor::new(calleefunc);
     pos.goto_after_inst(callsite);
@@ -88,11 +153,32 @@ pub fn inlinefn_into(calleefunc: &mut Function, callsite: Inst, func: &Function)
     }
     let mut fnmap: HashMap<ir::FuncRef, ir::FuncRef> = HashMap::new();
     for ef in func.dfg.ext_funcs.iter() {
-        fnmap.insert(
-            ef.0,
-            get_funcref_for_extfunc_name(&mut pos.func, &ef.1.name).unwrap(),
-        );
+        let funcref = if let Some(v) = get_funcref_for_extfunc_name(&mut pos.func, &ef.1.name) {
+            v
+        } else {
+            let data = ir::ExtFuncData {
+                name: ef.1.name.clone(),
+                signature: pos
+                    .func
+                    .import_signature(func.dfg.signatures[ef.1.signature].clone()),
+                colocated: ef.1.colocated,
+            };
+            pos.func.import_function(data)
+        };
+        fnmap.insert(ef.0, funcref);
     }
+
+    let mut slmap: HashMap<ir::StackSlot, ir::StackSlot> = HashMap::new();
+    // TODO: right now we don't patch the stack slot references
+    // so assert in cases where this is important.
+    assert!(func.stack_slots.keys().len() == 0 || pos.func.stack_slots.keys().len() == 0);
+    for sl in func.stack_slots.iter() {
+        let data = sl.1.clone();
+        assert!(data.offset.is_none());
+        let new_sl = pos.func.create_stack_slot(data);
+        slmap.insert(sl.0, new_sl);
+    }
+
     let mut bbmap: HashMap<ir::Ebb, ir::Ebb> = HashMap::new();
 
     let mut branches_need_fixing = Vec::new();
@@ -124,27 +210,37 @@ pub fn inlinefn_into(calleefunc: &mut Function, callsite: Inst, func: &Function)
                 continue;
             }
 
+            let get_arg = |arg: ir::Value| {
+                if !func.dfg.value_is_valid(arg) {
+                    return None;
+                }
+                let origarg = if !func.dfg.value_is_attached(arg) {
+                    // mmmh not sure if this is correct or if we should instead recreate the aliases?!?
+                    func.dfg.resolve_aliases(arg)
+                } else {
+                    arg
+                };
+                valuemap.get(&origarg).copied()
+            };
+
             let mut newinst = func.dfg[originst].clone();
             let valuelist = newinst.take_value_list();
             let inst = pos.func.dfg.make_inst(newinst);
             if let Some(_) = valuelist {
+                // todo handle stack_load, stack_store and stack_addr
                 for origarg in func.dfg.inst_args(originst) {
-                    if let Some(v) = valuemap.get(origarg) {
-                        pos.func.dfg.append_inst_arg(inst, *v);
+                    if let Some(v) = get_arg(*origarg) {
+                        pos.func.dfg.append_inst_arg(inst, v);
                     } else {
                         panic! {"need to handle this {}", origarg}
                     }
                 }
             }
 
+            //println! {"b {:?}", pos.func.dfg[inst]};
             for arg in pos.func.dfg.inst_fixed_args_mut(inst) {
-                let origarg = if !func.dfg.value_is_attached(*arg) {
-                    func.dfg.resolve_aliases(*arg)
-                } else {
-                    *arg
-                };
-                if let Some(v) = valuemap.get(&origarg) {
-                    *arg = *v;
+                if let Some(v) = get_arg(*arg) {
+                    *arg = v;
                 }
             }
 
@@ -178,7 +274,7 @@ pub fn inlinefn_into(calleefunc: &mut Function, callsite: Inst, func: &Function)
         }
     }
 
-    // fixup value refereces in continue block
+    // fixup value references in continue block
     let mut pos = FuncCursor::new(pos.func);
     let call_ret_val = pos.func.dfg.inst_results(callsite)[0];
     pos.goto_top(continue_block);
@@ -205,11 +301,14 @@ pub fn inlinefn_into(calleefunc: &mut Function, callsite: Inst, func: &Function)
     pos.layout_mut().remove_inst(callsite);
 }
 
-fn should_inline(module: &cranelift_llvm::Module, name: &ExternalName) -> bool {
-    match module.strings.get_str(name) {
+fn should_inline(name: &str) -> bool {
+    let ret = match name {
         "fib" => true,
+        "PyLong_FromLong" => true,
+        "PyLong_AsLong" => true,
         _ => false,
-    }
+    };
+    ret
 }
 
 fn find_callsites(func: &Function) -> Vec<(Inst, ir::ExternalName)> {
@@ -246,10 +345,16 @@ fn create_jit_module() -> Module<SimpleJITBackend> {
     });
     let target_isa = isa_builder.finish(settings::Flags::new(flag_builder));
 
-    Module::new(SimpleJITBuilder::with_isa(
-        target_isa,
-        default_libcall_names(),
-    ))
+    let mut jit_builder = SimpleJITBuilder::with_isa(target_isa, default_libcall_names());
+
+    // this is a hack for now: we supply all symbols but instead the JIT should provide us a way to supply a custom lookup function..
+    /*
+    for (name, addr) in SYMS.iter() {
+        jit_builder.symbol(name, *addr as *const u8);
+    }
+    */
+
+    Module::new(jit_builder)
 }
 
 pub fn jit_func(func_name: String) -> Result<*const u8, Error> {
@@ -270,87 +375,24 @@ pub fn jit_func(func_name: String) -> Result<*const u8, Error> {
     let func = func.unwrap();
     let tmodule = tmodule.unwrap();
 
-    for import in tmodule.imports.iter() {
-        if VERBOSITY > 0 {
-            println!(
-                "\timport: {:?}\t{}",
-                import,
-                tmodule.strings.get_str(&import.0)
-            );
-        }
-        if let cranelift_llvm::SymbolKind::Data { .. } = import.1 {
-            let idx = module
-                .declare_data(
-                    tmodule.strings.get_str(&import.0),
-                    Linkage::Import,
-                    false,
-                    None,
-                )
-                .unwrap();
-            if ExternalName::from(idx) != import.0 {
-                panic! {"mismatch {} != {}", ExternalName::from(idx), import.0};
-            }
-        }
-    }
-
-    for data in tmodule.data_symbols.iter() {
-        if VERBOSITY > 0 {
-            println!("\tdatasyms: {}", data);
-        }
-
-        let idx = module
-            .declare_data(
-                tmodule.strings.get_str(&data.name),
-                Linkage::Import,
-                false,
-                None,
-            )
-            .unwrap();
-        if ExternalName::from(idx) != data.name {
-            panic! {"mismatch {} != {}", ExternalName::from(idx), data.name};
-        }
-    }
-
     let func_a = module
         .declare_function(&func_name, Linkage::Local, &func.signature)
         .unwrap();
 
     ctx.func = func.clone();
+    let mapping = import_externs_into_module(&mut module, &tmodule, &mut ctx.func);
+
     let callsites = find_callsites(&ctx.func);
     for (callsite, name) in callsites {
-        if should_inline(tmodule, &name) {
-            if let Some(f) =
-                find_func_in_module(&tmodule, &tmodule.strings.get_str(&name).to_string())
-            {
-                inlinefn_into(&mut ctx.func, callsite, &f);
+        if let ir::ExternalName::User { index, .. } = name {
+            let func_id = FuncId::from_u32(index);
+            let name_str = mapping.get(&func_id).unwrap();
+            if should_inline(&name_str) {
+                if let Some(mut f) = find_func_in_module(&tmodule, &name_str) {
+                    import_externs_into_module(&mut module, &tmodule, &mut f);
+                    inlinefn_into(&mut ctx.func, callsite, &f);
+                }
             }
-        }
-    }
-
-    for ext_func in ctx.func.dfg.ext_funcs.iter_mut() {
-        if VERBOSITY > 0 {
-            println!(
-                "\textern function: {:?}\t{}",
-                ext_func,
-                tmodule.strings.get_str(&ext_func.1.name)
-            );
-        }
-        if let ExternalName::LibCall(..) = ext_func.1.name {
-            continue;
-        }
-        let new_id = module
-            .declare_function(
-                tmodule.strings.get_str(&ext_func.1.name),
-                Linkage::Import,
-                &func.dfg.signatures[ext_func.1.signature],
-            )
-            .unwrap();
-
-        if ext_func.1.name != ExternalName::from(new_id) {
-            if VERBOSITY > 0 {
-                println!("\t\tremapping to {}", ExternalName::from(new_id));
-            }
-            ext_func.1.name = ExternalName::from(new_id);
         }
     }
 
@@ -373,6 +415,8 @@ pub fn jit_func(func_name: String) -> Result<*const u8, Error> {
 
         println!("\n{}", ctx.func.display(module.isa()));
     }
+
+    println! {"{} has now {} insts", func_name, ctx.func.dfg.num_insts()};
 
     module.clear_context(&mut ctx);
 
