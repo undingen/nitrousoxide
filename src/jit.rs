@@ -102,6 +102,14 @@ pub fn inlinefn_into(calleefunc: &mut Function, callsite: Inst, func: &Function)
             let new_ebb = pos.func.dfg.make_ebb();
             pos.insert_ebb(new_ebb);
             bbmap.insert(block, new_ebb);
+
+            for param in func.dfg.ebb_params(block) {
+                let v = pos
+                    .func
+                    .dfg
+                    .append_ebb_param(new_ebb, func.dfg.value_type(*param));
+                valuemap.insert(*param, v);
+            }
         } else {
             pos.goto_after_inst(callsite);
         }
@@ -130,7 +138,12 @@ pub fn inlinefn_into(calleefunc: &mut Function, callsite: Inst, func: &Function)
             }
 
             for arg in pos.func.dfg.inst_fixed_args_mut(inst) {
-                if let Some(v) = valuemap.get(arg) {
+                let origarg = if !func.dfg.value_is_attached(*arg) {
+                    func.dfg.resolve_aliases(*arg)
+                } else {
+                    *arg
+                };
+                if let Some(v) = valuemap.get(&origarg) {
                     *arg = *v;
                 }
             }
@@ -155,6 +168,7 @@ pub fn inlinefn_into(calleefunc: &mut Function, callsite: Inst, func: &Function)
             }
 
             pos.insert_inst(inst);
+            assert!(func.dfg.inst_results(originst).len() <= 1);
             pos.func.dfg.make_inst_results(inst, ctrl_typevar);
 
             for (i, r) in func.dfg.inst_results(originst).iter().enumerate() {
