@@ -15,4 +15,8 @@ __This is a very early prototype and only work for very simple cases__
 - cargo build
 - make test1
 
+## Test with CPython
+- make cpython *# fetch cpython and compile it*
+- make pytest1
+
 
